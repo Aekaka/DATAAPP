@@ -1,0 +1,11 @@
+age,income,education,job_satisfaction
+25,30000,Bachelors,High
+30,45000,Masters,Medium
+35,60000,PhD,High
+28,35000,Bachelors,Low
+40,75000,Masters,High
+45,80000,PhD,Medium
+32,50000,Masters,High
+27,32000,Bachelors,Medium
+38,65000,Masters,High
+42,70000,PhD,Low 
