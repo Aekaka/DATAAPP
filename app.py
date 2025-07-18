@@ -16,6 +16,15 @@ import time
 from datetime import datetime
 import io
 import base64
+import openai
+import os
+from sklearn.feature_selection import mutual_info_classif
+from supabase import create_client, Client
+from openai import OpenAI
+import json
+import plotly.figure_factory as ff
+from plotly.subplots import make_subplots
+import tempfile
 
 # Set page configuration
 st.set_page_config(
@@ -69,6 +78,11 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
+# Supabase configuration
+SUPABASE_URL = "https://bwngewxnlsiqmgffdrkz.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJ3bmdld3hubHNpcW1nZmZkcmt6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDk0NjUwNzcsImV4cCI6MjA2NTA0MTA3N30.UptU1TZyyUOl62lPdqjGPftDXt3cKqFxsOU00hcuy6A"
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 def initialize_chat_history():
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -118,7 +132,18 @@ def validate_data(df):
 def load_data(file):
     """Load and cache data from uploaded file."""
     try:
-        df = pd.read_csv(file, low_memory=False)
+        file_extension = file.name.split('.')[-1].lower()
+        if file_extension == 'csv':
+            df = pd.read_csv(file, low_memory=False)
+        elif file_extension == 'xlsx':
+            df = pd.read_excel(file)
+        elif file_extension == 'json':
+            df = pd.read_json(file)
+        elif file_extension == 'parquet':
+            df = pd.read_parquet(file)
+        else:
+            st.error(f"Unsupported file type: {file_extension}")
+            return None
         
         # Basic cleaning
         # Replace infinite values with NaN
@@ -128,10 +153,25 @@ def load_data(file):
         for col in df.columns:
             if df[col].dtype == 'object':
                 try:
-                    pd.to_datetime(df[col])
-                    df[col] = pd.to_datetime(df[col])
+                    # First check if the column contains any non-null values
+                    if df[col].notna().any():
+                        # Try to convert to datetime
+                        pd.to_datetime(df[col], errors='coerce')
+                        df[col] = pd.to_datetime(df[col], errors='coerce')
                 except:
+                    # If conversion fails, keep as object type
                     pass
+        
+        # Ensure all numeric columns are properly typed
+        for col in df.select_dtypes(include=['object']).columns:
+            try:
+                # Try to convert to numeric, coercing errors to NaN
+                numeric_series = pd.to_numeric(df[col], errors='coerce')
+                # If more than 50% of values are numeric, convert the column
+                if numeric_series.notna().mean() > 0.5:
+                    df[col] = numeric_series
+            except:
+                pass
         
         return df
     except Exception as e:
@@ -423,35 +463,212 @@ def perform_clustering(df, n_clusters=3):
         'explained_variance': pca.explained_variance_ratio_
     }
 
+def get_ai_response(question, df):
+    """Get a response from the OpenAI GPT model based on the user's question and the dataset."""
+    prompt = f"Given the following dataset:\n{df.head().to_string()}\n\nAnswer the question: {question}"
+    
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",  # Change to a model you have access to
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return response['choices'][0]['message']['content']
+    except Exception as e:
+        return f"An error occurred: {str(e)}"
+
+def get_answer(question, context):
+    inputs = tokenizer(question, context, return_tensors="pt")
+    # Move inputs to CPU
+    inputs = {k: v.to('cpu') for k, v in inputs.items()}
+    outputs = model(**inputs)
+    answer_start = outputs.start_logits.argmax().item()
+    answer_end = outputs.end_logits.argmax().item()
+    answer = tokenizer.convert_tokens_to_string(
+        tokenizer.convert_ids_to_tokens(
+            inputs["input_ids"][0][answer_start:answer_end + 1]
+        )
+    )
+    return answer
+
 def main():
     st.title("🤖 Advanced Data Explorer")
+    st.markdown('<div id="main-content"></div>', unsafe_allow_html=True)
     st.markdown("""
-    Welcome to the Advanced Data Explorer! Upload your CSV file and let's discover insights together.
-    This tool provides comprehensive analysis, visualization, and machine learning capabilities.
-    """)
+    <span style='font-size:1.2em;'>Welcome to the Advanced Data Explorer! Upload your data file and let's discover insights together.<br>
+    This tool provides comprehensive analysis, visualization, and machine learning capabilities.<br>
+    <b>All features are accessible and user-friendly.</b></span>
+    """, unsafe_allow_html=True)
+    
+    # Add a skip link for accessibility
+    st.markdown('<a href="#main-content" class="skip-link" style="position:absolute;left:-10000px;top:auto;width:1px;height:1px;overflow:hidden;">Skip to Main Content</a>', unsafe_allow_html=True)
     
     # Sidebar for settings and options
     with st.sidebar:
         st.header("⚙️ Settings")
-        show_advanced = st.checkbox("Show Advanced Options", value=False)
+        show_advanced = st.checkbox("Show Advanced Options", value=False, help="Show or hide advanced data processing options.")
         if show_advanced:
             st.subheader("Data Processing")
             handle_missing = st.selectbox(
                 "Handle Missing Values",
                 ["median/mode", "mean", "drop", "none"],
-                help="Choose how to handle missing values in the dataset"
+                help="Choose how to handle missing values in the dataset."
             )
             remove_outliers = st.checkbox(
                 "Remove Outliers",
-                help="Automatically remove statistical outliers from numerical columns"
+                help="Automatically remove statistical outliers from numerical columns."
             )
     
-    # Main content
-    uploaded_file = st.file_uploader("📤 Upload your CSV file", type=['csv'])
+    # --- Supabase Authentication UI ---
+    if 'user' not in st.session_state:
+        st.session_state['user'] = None
+    auth_mode = st.sidebar.radio("Authentication", ["Login", "Sign Up"], help="Sign in or create a new account.")
+    email = st.sidebar.text_input("Email", help="Enter your email address.")
+    password = st.sidebar.text_input("Password", type="password", help="Enter your password.")
     
+    if st.session_state['user']:
+        try:
+            user_email = st.session_state['user'].email
+            st.sidebar.success(f"Logged in as: {user_email}")
+            if st.sidebar.button("Log Out"):
+                st.session_state['user'] = None
+                st.rerun()
+        except AttributeError:
+            st.sidebar.error("Session error. Please log in again.")
+            st.session_state['user'] = None
+            st.rerun()
+    else:
+        if auth_mode == "Login":
+            if st.sidebar.button("Login"):
+                if not email or not password:
+                    st.sidebar.error("Please enter both email and password.")
+                else:
+                    try:
+                        res = supabase.auth.sign_in_with_password({"email": email, "password": password})
+                        if res.user:
+                            st.session_state['user'] = res.user
+                            st.success("Logged in successfully!")
+                            st.rerun()
+                        else:
+                            st.error("Login failed. Please check your credentials.")
+                    except Exception as e:
+                        st.sidebar.error(f"Login error: {str(e)}")
+        else:
+            if st.sidebar.button("Sign Up"):
+                if not email or not password:
+                    st.sidebar.error("Please enter both email and password.")
+                elif len(password) < 6:
+                    st.sidebar.error("Password must be at least 6 characters long.")
+                else:
+                    try:
+                        res = supabase.auth.sign_up({"email": email, "password": password})
+                        if res.user:
+                            st.session_state['user'] = res.user
+                            st.sidebar.success("Sign up successful! You are now logged in.")
+                            st.rerun()
+                        else:
+                            st.sidebar.error("Sign up failed. Try a different email.")
+                    except Exception as e:
+                        st.sidebar.error(f"Sign up error: {str(e)}")
+    if not st.session_state['user']:
+        st.warning("Please log in or sign up to use the app.")
+        st.stop()
+    
+    # Main content
+    uploaded_file = st.file_uploader(
+        "📤 Upload your data file",
+        type=['csv', 'xlsx', 'json', 'parquet'],
+        help="Supported formats: CSV, Excel, JSON, Parquet. Upload your main dataset here."
+    )
+
+    # --- Dataset Storage & Retrieval ---
     if uploaded_file is not None:
         try:
-            with st.spinner('Reading and analyzing your data...'):
+            # Save file to Supabase Storage
+            user_id = st.session_state['user'].id
+            file_path = f"{user_id}/{uploaded_file.name}"
+            file_bytes = uploaded_file.getvalue()
+            
+            # Upload to storage
+            storage_response = supabase.storage.from_('datasets').upload(
+                file_path,
+                file_bytes
+            )
+            
+            if storage_response:
+                # Save metadata to dataset_files table
+                data = {
+                    'user_id': user_id,
+                    'filename': uploaded_file.name,
+                    'upload_date': datetime.now().isoformat(),
+                    'storage_path': file_path
+                }
+                
+                response = supabase.table('dataset_files').insert(data).execute()
+                
+                if response:
+                    st.success(f"File '{uploaded_file.name}' uploaded and saved!")
+                    st.session_state.uploaded_file = uploaded_file
+                else:
+                    st.error("Error saving file metadata. Please try again.")
+            else:
+                st.error("Error uploading file to storage. Please try again.")
+            
+        except Exception as e:
+            st.error(f"Error uploading file: {str(e)}")
+            st.info("Please make sure you're logged in and have the correct permissions.")
+
+    # List previous files for this user
+    try:
+        user_id = st.session_state['user'].id
+        response = supabase.table('dataset_files').select('*').eq('user_id', user_id).execute()
+        if response.data:
+            st.subheader("📂 Your Uploaded Datasets")
+            files = [file['filename'] for file in response.data]
+            selected_file = st.selectbox("Select a file to load", files)
+            
+            if selected_file:
+                file_data = next((f for f in response.data if f['filename'] == selected_file), None)
+                if file_data:
+                    try:
+                        file_bytes = supabase.storage.from_('datasets').download(file_data['storage_path'])
+                        if file_bytes:
+                            # Create a temporary file to read with pandas
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{selected_file.split('.')[-1]}") as tmp_file:
+                                tmp_file.write(file_bytes)
+                                tmp_file.flush()
+                                
+                                # Read the file based on its extension
+                                file_extension = selected_file.split('.')[-1].lower()
+                                if file_extension == 'csv':
+                                    df = pd.read_csv(tmp_file.name, low_memory=False)
+                                elif file_extension == 'xlsx':
+                                    df = pd.read_excel(tmp_file.name)
+                                elif file_extension == 'json':
+                                    df = pd.read_json(tmp_file.name)
+                                elif file_extension == 'parquet':
+                                    df = pd.read_parquet(tmp_file.name)
+                                else:
+                                    st.error(f"Unsupported file type: {file_extension}")
+                                    return None
+                                
+                                st.success(f"Loaded '{selected_file}' from your storage!")
+                                return df
+                    except Exception as e:
+                        st.error(f"Error loading file: {str(e)}")
+                        return None
+    except Exception as e:
+        st.error(f"Error retrieving files: {str(e)}")
+        return None
+
+    if uploaded_file is None:
+        st.info("Upload a new file or select one of your previous files above to get started.")
+        st.stop()
+
+    if uploaded_file is not None:
+        try:
+            with st.spinner('🔄 Reading and analyzing your data...'):
                 # Load and validate data
                 df = load_data(uploaded_file)
                 if df is None:
@@ -460,7 +677,7 @@ def main():
                 # Check for data issues
                 issues = validate_data(df)
                 if issues:
-                    st.warning("⚠️ Data Quality Issues Detected:")
+                    st.warning("⚠️ <b>Data Quality Issues Detected:</b>", icon="⚠️")
                     for issue in issues:
                         st.write(f"- {issue}")
                 
@@ -471,16 +688,21 @@ def main():
                 st.markdown(get_csv_download_link(df_processed, "processed_data.csv"), unsafe_allow_html=True)
                 
                 # Display raw data
-                with st.expander("🔍 View Raw Data"):
+                with st.expander("🔍 View Raw Data", expanded=False):
                     st.dataframe(df)
                 
                 # Create tabs
-                tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
                     "📊 Overview",
                     "🔍 Insights",
                     "📈 Visualizations",
                     "🎯 Machine Learning",
-                    "🔬 Advanced Analysis"
+                    "🔬 Advanced Analysis",
+                    "🤖 Ask the AI",
+                    "🔗 Joining",
+                    "🔄 Structuring",
+                    "🧹 Cleaning & Wrangling",
+                    "💡 Insights & Recommendations"
                 ])
                 
                 with tab1:
@@ -513,47 +735,100 @@ def main():
                     )
                     
                     target_col = st.selectbox("Select Target Variable", df.columns)
+                    
+                    # Check if target type matches problem type
+                    target_is_numeric = np.issubdtype(df[target_col].dtype, np.number)
+                    if problem_type == 'classification' and target_is_numeric:
+                        st.warning("You selected classification, but your target variable is continuous. Please select regression or choose a categorical target.")
+                        if st.button("Switch to Regression"):
+                            problem_type = 'regression'
+                    elif problem_type == 'regression' and not target_is_numeric:
+                        st.warning("You selected regression, but your target variable is categorical. Please select classification or choose a numeric target.")
+                        if st.button("Switch to Classification"):
+                            problem_type = 'classification'
+                    
+                    # Suggest relevant features based on correlation with the target
+                    if problem_type == 'regression':
+                        correlations = df.corr()[target_col].abs().sort_values(ascending=False)
+                        suggested_features = correlations.index[1:6].tolist()  # Top 5 correlated features
+                    else:
+                        # For classification, use mutual information
+                        try:
+                            mi_scores = mutual_info_classif(df.drop(columns=[target_col]), df[target_col])
+                            mi_scores = pd.Series(mi_scores, index=df.drop(columns=[target_col]).columns)
+                            suggested_features = mi_scores.sort_values(ascending=False).index[:5].tolist()
+                        except Exception as e:
+                            st.warning(f"Could not compute feature relevance for classification: {e}")
+                            suggested_features = [col for col in df.columns if col != target_col][:5]
+                    
+                    st.write("Suggested features based on relevance:")
+                    st.write(suggested_features)
+                    
                     feature_cols = st.multiselect(
                         "Select Features",
                         [col for col in df.columns if col != target_col],
-                        default=[col for col in df.columns if col != target_col]
+                        default=suggested_features
                     )
                     
                     if st.button("Train Model"):
                         with st.spinner('Training model...'):
-                            results = train_model(df_processed[feature_cols + [target_col]], 
-                                               target_col,
-                                               problem_type)
-                            
-                            if 'error' in results:
-                                st.error(results['error'])
-                            else:
-                                st.success("Model training complete!")
-                                
-                                if problem_type == 'classification':
-                                    st.metric("Model Accuracy", f"{results['accuracy']:.2%}")
+                            try:
+                                results = train_model(df_processed[feature_cols + [target_col]], 
+                                                   target_col,
+                                                   problem_type)
+                                if 'error' in results:
+                                    st.error(results['error'])
+                                    # If error is about label type, prompt user
+                                    if 'Unknown label type' in results['error']:
+                                        st.warning("This error usually means the target variable type does not match the selected problem type. Please check your selections above.")
+                                else:
+                                    st.success("Model training complete!")
                                     
-                                    # Confusion Matrix
-                                    st.subheader("Confusion Matrix")
-                                    fig = px.imshow(
-                                        results['confusion_matrix'],
-                                        labels=dict(x="Predicted", y="Actual"),
-                                        title="Confusion Matrix"
+                                    if problem_type == 'classification':
+                                        st.metric("Model Accuracy", f"{results['accuracy']:.2%}")
+                                        
+                                        # Confusion Matrix
+                                        st.subheader("Confusion Matrix")
+                                        fig = px.imshow(
+                                            results['confusion_matrix'],
+                                            labels=dict(x="Predicted", y="Actual"),
+                                            title="Confusion Matrix"
+                                        )
+                                        st.plotly_chart(fig, use_container_width=True)
+                                    else:
+                                        st.metric("R² Score", f"{results['r2']:.2%}")
+                                        st.metric("Mean Squared Error", f"{results['mse']:.4f}")
+                                    
+                                    # Feature Importance
+                                    st.subheader("Feature Importance")
+                                    fig = px.bar(
+                                        results['feature_importance'],
+                                        x='importance', y='feature',
+                                        orientation='h',
+                                        title="Feature Importance"
                                     )
                                     st.plotly_chart(fig, use_container_width=True)
-                                else:
-                                    st.metric("R² Score", f"{results['r2']:.2%}")
-                                    st.metric("Mean Squared Error", f"{results['mse']:.4f}")
-                                
-                                # Feature Importance
-                                st.subheader("Feature Importance")
-                                fig = px.bar(
-                                    results['feature_importance'],
-                                    x='importance', y='feature',
-                                    orientation='h',
-                                    title="Feature Importance"
-                                )
-                                st.plotly_chart(fig, use_container_width=True)
+                                    
+                                    # Prediction Section
+                                    st.subheader("Make Predictions")
+                                    input_data = {}
+                                    for feature in feature_cols:
+                                        input_data[feature] = st.number_input(f"Enter {feature}", value=float(df[feature].mean()))
+                                    
+                                    if st.button("Predict"):
+                                        input_df = pd.DataFrame([input_data])
+                                        prediction = results['model'].predict(input_df)
+                                        # Clear, styled output for prediction
+                                        if problem_type == 'classification':
+                                            st.success(f"<span style='font-size:1.5em;'><b>Predicted Class:</b> {prediction[0]}</span>", icon="🔮", unsafe_allow_html=True)
+                                            st.markdown("<span style='color: #555;'>This is the predicted class for your input. For more details, check the confusion matrix and feature importance above.</span>", unsafe_allow_html=True)
+                                        else:
+                                            st.info(f"<span style='font-size:1.5em;'><b>Predicted Value:</b> {prediction[0]}</span>", icon="📈", unsafe_allow_html=True)
+                                            st.markdown("<span style='color: #555;'>This is the predicted value for your input. For more details, check the R² score and feature importance above.</span>", unsafe_allow_html=True)
+                            except Exception as e:
+                                st.error(f"An error occurred: {str(e)}")
+                                if 'Unknown label type' in str(e):
+                                    st.warning("This error usually means the target variable type does not match the selected problem type. Please check your selections above.")
                 
                 with tab5:
                     st.header("Advanced Analysis")
@@ -592,6 +867,275 @@ def main():
                         
                         correlation = df[var1].corr(df[var2])
                         st.metric("Correlation Coefficient", f"{correlation:.3f}")
+
+                with tab6:  # AI Chat Tab
+                    user_question = st.text_input("What would you like to know about your data?")
+                    if st.button("Get Answer"):
+                        if user_question:
+                            with st.spinner('Getting response from AI...'):
+                                # Use only a small sample for context
+                                context = df_processed.head(10).to_string()
+                                try:
+                                    ai_response = get_answer(user_question, context)
+                                    st.markdown("### AI Response:")
+                                    st.write(ai_response)
+                                except Exception as e:
+                                    st.error(f"An error occurred: {str(e)}")
+                        else:
+                            st.warning("Please enter a question.")
+
+                with tab7:  # Joining tab
+                    st.header("Join Datasets")
+                    st.write("Upload a second dataset to join with your main dataset.")
+                    join_file = st.file_uploader("Upload second data file", type=['csv', 'xlsx', 'json', 'parquet'], key='join_file')
+                    if join_file is not None:
+                        join_df = load_data(join_file)
+                        st.write("Second dataset preview:")
+                        st.dataframe(join_df.head())
+                        # Select join keys
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            left_key = st.selectbox("Select join key from main dataset", df.columns)
+                        with col2:
+                            right_key = st.selectbox("Select join key from second dataset", join_df.columns)
+                        join_type = st.selectbox("Select join type", ['inner', 'left', 'right', 'outer'])
+                        if st.button("Join Datasets"):
+                            try:
+                                merged_df = pd.merge(df, join_df, left_on=left_key, right_on=right_key, how=join_type)
+                                st.success(f"Datasets joined successfully! Shape: {merged_df.shape}")
+                                st.dataframe(merged_df.head())
+                                st.markdown(get_csv_download_link(merged_df, "joined_data.csv"), unsafe_allow_html=True)
+                            except Exception as e:
+                                st.error(f"Error joining datasets: {str(e)}")
+
+                with tab8:  # Structuring tab
+                    st.header("Reshape & Structure Data")
+                    st.write("Perform pivot, melt (unpivot), and reorder columns.")
+                    struct_op = st.selectbox("Select structuring operation", ["Pivot", "Melt", "Reorder Columns"])
+                    if struct_op == "Pivot":
+                        index_col = st.selectbox("Index column", df.columns)
+                        columns_col = st.selectbox("Columns to pivot", [col for col in df.columns if col != index_col])
+                        values_col = st.selectbox("Values column", [col for col in df.columns if col not in [index_col, columns_col]])
+                        if st.button("Pivot Data"):
+                            try:
+                                pivoted = df.pivot(index=index_col, columns=columns_col, values=values_col)
+                                st.dataframe(pivoted.head())
+                                st.markdown(get_csv_download_link(pivoted.reset_index(), "pivoted_data.csv"), unsafe_allow_html=True)
+                            except Exception as e:
+                                st.error(f"Error in pivot: {str(e)}")
+                    elif struct_op == "Melt":
+                        id_vars = st.multiselect("ID variables (keep these columns)", df.columns)
+                        value_vars = st.multiselect("Value variables (unpivot these columns)", [col for col in df.columns if col not in id_vars])
+                        if st.button("Melt Data"):
+                            try:
+                                melted = pd.melt(df, id_vars=id_vars, value_vars=value_vars)
+                                st.dataframe(melted.head())
+                                st.markdown(get_csv_download_link(melted, "melted_data.csv"), unsafe_allow_html=True)
+                            except Exception as e:
+                                st.error(f"Error in melt: {str(e)}")
+                    elif struct_op == "Reorder Columns":
+                        new_order = st.multiselect("Select new column order", df.columns, default=list(df.columns))
+                        if st.button("Reorder Columns"):
+                            try:
+                                reordered = df[new_order]
+                                st.dataframe(reordered.head())
+                                st.markdown(get_csv_download_link(reordered, "reordered_data.csv"), unsafe_allow_html=True)
+                            except Exception as e:
+                                st.error(f"Error in reordering: {str(e)}")
+
+                with tab9:
+                    st.header("Advanced Data Cleaning & Wrangling")
+                    wrangle_df = df.copy()
+
+                    st.subheader("1. Missing Value Handling")
+                    missing_summary = wrangle_df.isnull().sum()
+                    st.write("Missing values per column:")
+                    st.dataframe(missing_summary[missing_summary > 0])
+                    for col in wrangle_df.columns:
+                        if wrangle_df[col].isnull().any():
+                            st.write(f"Column: {col}")
+                            method = st.selectbox(f"How to handle missing values in {col}?", ["Do nothing", "Drop rows", "Fill with mean", "Fill with median", "Fill with mode", "Fill with custom value", "Forward fill", "Backward fill"], key=f"na_{col}")
+                            if method == "Drop rows":
+                                wrangle_df = wrangle_df.dropna(subset=[col])
+                            elif method == "Fill with mean" and wrangle_df[col].dtype in [np.float64, np.int64]:
+                                wrangle_df[col] = wrangle_df[col].fillna(wrangle_df[col].mean())
+                            elif method == "Fill with median" and wrangle_df[col].dtype in [np.float64, np.int64]:
+                                wrangle_df[col] = wrangle_df[col].fillna(wrangle_df[col].median())
+                            elif method == "Fill with mode":
+                                wrangle_df[col] = wrangle_df[col].fillna(wrangle_df[col].mode()[0])
+                            elif method == "Fill with custom value":
+                                custom_val = st.text_input(f"Custom value for {col}", key=f"custom_{col}")
+                                if custom_val:
+                                    wrangle_df[col] = wrangle_df[col].fillna(custom_val)
+                            elif method == "Forward fill":
+                                wrangle_df[col] = wrangle_df[col].fillna(method='ffill')
+                            elif method == "Backward fill":
+                                wrangle_df[col] = wrangle_df[col].fillna(method='bfill')
+
+                    st.subheader("2. Duplicate Handling")
+                    dup_count = wrangle_df.duplicated().sum()
+                    st.write(f"Duplicate rows: {dup_count}")
+                    if dup_count > 0:
+                        if st.button("Drop Duplicates"):
+                            wrangle_df = wrangle_df.drop_duplicates()
+                            st.success("Duplicates dropped.")
+
+                    st.subheader("3. Outlier Detection & Handling")
+                    num_cols = wrangle_df.select_dtypes(include=[np.number]).columns
+                    outlier_method = st.selectbox("Outlier detection method", ["None", "IQR", "Z-score"])
+                    if outlier_method != "None":
+                        for col in num_cols:
+                            st.write(f"Column: {col}")
+                            if outlier_method == "IQR":
+                                Q1 = wrangle_df[col].quantile(0.25)
+                                Q3 = wrangle_df[col].quantile(0.75)
+                                IQR = Q3 - Q1
+                                lower = Q1 - 1.5 * IQR
+                                upper = Q3 + 1.5 * IQR
+                                outliers = (wrangle_df[col] < lower) | (wrangle_df[col] > upper)
+                            elif outlier_method == "Z-score":
+                                z = (wrangle_df[col] - wrangle_df[col].mean()) / wrangle_df[col].std()
+                                outliers = abs(z) > 3
+                            st.write(f"Outliers detected: {outliers.sum()}")
+                            outlier_action = st.selectbox(f"How to handle outliers in {col}?", ["Do nothing", "Remove", "Cap to bounds"], key=f"out_{col}")
+                            if outlier_action == "Remove":
+                                wrangle_df = wrangle_df[~outliers]
+                            elif outlier_action == "Cap to bounds":
+                                if outlier_method == "IQR":
+                                    wrangle_df[col] = np.where(wrangle_df[col] < lower, lower, wrangle_df[col])
+                                    wrangle_df[col] = np.where(wrangle_df[col] > upper, upper, wrangle_df[col])
+                                elif outlier_method == "Z-score":
+                                    cap = 3 * wrangle_df[col].std()
+                                    wrangle_df[col] = np.where(wrangle_df[col] < -cap, -cap, wrangle_df[col])
+                                    wrangle_df[col] = np.where(wrangle_df[col] > cap, cap, wrangle_df[col])
+
+                    st.subheader("4. Data Type Conversion")
+                    for col in wrangle_df.columns:
+                        dtype = str(wrangle_df[col].dtype)
+                        st.write(f"{col}: {dtype}")
+                        new_type = st.selectbox(f"Convert {col} to:", [dtype, "int", "float", "str", "datetime"], key=f"dtype_{col}")
+                        if new_type != dtype:
+                            try:
+                                if new_type == "int":
+                                    wrangle_df[col] = wrangle_df[col].astype(int)
+                                elif new_type == "float":
+                                    wrangle_df[col] = wrangle_df[col].astype(float)
+                                elif new_type == "str":
+                                    wrangle_df[col] = wrangle_df[col].astype(str)
+                                elif new_type == "datetime":
+                                    wrangle_df[col] = pd.to_datetime(wrangle_df[col], errors='coerce')
+                            except Exception as e:
+                                st.error(f"Error converting {col}: {str(e)}")
+
+                    st.subheader("5. String Operations")
+                    str_cols = wrangle_df.select_dtypes(include=[object]).columns
+                    for col in str_cols:
+                        st.write(f"Column: {col}")
+                        str_op = st.selectbox(f"String operation for {col}", ["None", "Trim whitespace", "To lowercase", "To uppercase", "Remove special characters", "Extract substring"], key=f"str_{col}")
+                        if str_op == "Trim whitespace":
+                            wrangle_df[col] = wrangle_df[col].str.strip()
+                        elif str_op == "To lowercase":
+                            wrangle_df[col] = wrangle_df[col].str.lower()
+                        elif str_op == "To uppercase":
+                            wrangle_df[col] = wrangle_df[col].str.upper()
+                        elif str_op == "Remove special characters":
+                            wrangle_df[col] = wrangle_df[col].str.replace(r'[^\w\s]', '', regex=True)
+                        elif str_op == "Extract substring":
+                            start = st.number_input(f"Start index for {col}", min_value=0, value=0, key=f"start_{col}")
+                            end = st.number_input(f"End index for {col}", min_value=0, value=5, key=f"end_{col}")
+                            wrangle_df[col] = wrangle_df[col].str[start:end]
+
+                    st.subheader("6. Custom Column Creation")
+                    new_col_name = st.text_input("New column name")
+                    formula = st.text_input("Formula (e.g., col1 + col2 * 2)")
+                    if st.button("Create Column") and new_col_name and formula:
+                        try:
+                            wrangle_df[new_col_name] = eval(formula, {}, wrangle_df)
+                            st.success(f"Column '{new_col_name}' created.")
+                        except Exception as e:
+                            st.error(f"Error creating column: {str(e)}")
+
+                    st.subheader("Preview & Download Cleaned Data")
+                    st.dataframe(wrangle_df.head())
+                    st.markdown(get_csv_download_link(wrangle_df, "cleaned_data.csv"), unsafe_allow_html=True)
+
+                with tab10:
+                    st.header("Automated Insights & Recommendations")
+                    # Use cleaned/wrangled data if available, else use df
+                    try:
+                        wrangle_df
+                    except NameError:
+                        wrangle_df = df
+                    insights = []
+                    recommendations = []
+
+                    # 1. High missing values
+                    missing = wrangle_df.isnull().mean()
+                    high_missing = missing[missing > 0.2]
+                    if not high_missing.empty:
+                        for col, pct in high_missing.items():
+                            insights.append(f"Column '{col}' has {pct:.0%} missing values.")
+                            recommendations.append(f"Consider dropping or imputing '{col}'.")
+
+                    # 2. High cardinality categorical columns
+                    cat_cols = wrangle_df.select_dtypes(include='object').columns
+                    for col in cat_cols:
+                        n_unique = wrangle_df[col].nunique()
+                        if n_unique > 50:
+                            insights.append(f"Column '{col}' has high cardinality ({n_unique} unique values).")
+                            recommendations.append(f"Consider encoding or reducing categories in '{col}'.")
+
+                    # 3. Outliers in numeric columns
+                    num_cols = wrangle_df.select_dtypes(include=[np.number]).columns
+                    for col in num_cols:
+                        Q1 = wrangle_df[col].quantile(0.25)
+                        Q3 = wrangle_df[col].quantile(0.75)
+                        IQR = Q3 - Q1
+                        lower = Q1 - 1.5 * IQR
+                        upper = Q3 + 1.5 * IQR
+                        outliers = ((wrangle_df[col] < lower) | (wrangle_df[col] > upper)).sum()
+                        if outliers > 0:
+                            insights.append(f"Column '{col}' has {outliers} outliers (IQR method).")
+                            recommendations.append(f"Consider capping or removing outliers in '{col}'.")
+
+                    # 4. Top correlated features (if target exists)
+                    if 'target_col' in locals() and target_col in wrangle_df.columns:
+                        corr = wrangle_df.corr()[target_col].drop(target_col).abs().sort_values(ascending=False)
+                        top_corr = corr.head(3)
+                        for col, val in top_corr.items():
+                            insights.append(f"'{col}' is strongly correlated with target ({val:.2f}).")
+                            recommendations.append(f"Consider using '{col}' as a key feature for prediction.")
+
+                    # 5. Notable trends (time or group based)
+                    date_cols = wrangle_df.select_dtypes(include='datetime').columns
+                    if len(date_cols) > 0:
+                        for col in date_cols:
+                            if wrangle_df[col].nunique() > 10:
+                                trend = wrangle_df.groupby(wrangle_df[col].dt.year).size()
+                                if trend.max() > 2 * trend.min():
+                                    insights.append(f"Significant change in data volume over years in '{col}'.")
+                                    recommendations.append(f"Investigate reasons for change in '{col}'.")
+
+                    # 6. Clusters or segments (if clustering done)
+                    if 'clustering_results' in locals() and 'clusters' in clustering_results:
+                        n_clusters = len(set(clustering_results['clusters']))
+                        insights.append(f"Data forms {n_clusters} clusters.")
+                        recommendations.append(f"Analyze clusters for targeted actions.")
+
+                    # Display insight cards
+                    st.subheader("Key Insights")
+                    if insights:
+                        for i, insight in enumerate(insights):
+                            st.info(f"{i+1}. {insight}")
+                    else:
+                        st.success("No major issues or trends detected.")
+
+                    st.subheader("Actionable Recommendations")
+                    if recommendations:
+                        for i, rec in enumerate(recommendations):
+                            st.warning(f"{i+1}. {rec}")
+                    else:
+                        st.success("No immediate actions recommended.")
         
         except Exception as e:
             st.error(f"An error occurred: {str(e)}")
@@ -604,4 +1148,5 @@ def main():
             """)
 
 if __name__ == "__main__":
+    openai.api_key = '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'
     main() 
